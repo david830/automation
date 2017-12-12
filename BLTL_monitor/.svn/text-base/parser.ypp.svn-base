@@ -1,0 +1,1075 @@
+/***********************************************************************************************
+Copyright (C) 2010 Anvesh Komuravelli, Paolo Zuliani and Edmund M. Clarke.  All rights reserved.
+By using this software the USER indicates that he or she has read, understood and will comply
+with the following:
+
+1. The USER is hereby granted non-exclusive permission to use, copy and/or
+modify this software for internal, non-commercial, research purposes only. Any
+distribution, including commercial sale or license, of this software, copies of
+the software, its associated documentation and/or modifications of either is
+strictly prohibited without the prior consent of the authors. Title to copyright
+to this software and its associated documentation shall at all times remain with
+the authors. Appropriated copyright notice shall be placed on all software
+copies, and a complete copy of this notice shall be included in all copies of
+the associated documentation. No right is granted to use in advertising,
+publicity or otherwise any trademark, service mark, or the name of the authors.
+
+2. This software and any associated documentation is provided "as is".
+
+THE AUTHORS MAKE NO REPRESENTATIONS OR WARRANTIES, EXPRESSED OR IMPLIED,
+INCLUDING THOSE OF MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, OR THAT
+USE OF THE SOFTWARE, MODIFICATIONS, OR ASSOCIATED DOCUMENTATION WILL NOT
+INFRINGE ANY PATENTS, COPYRIGHTS, TRADEMARKS OR OTHER INTELLECTUAL PROPERTY
+RIGHTS OF A THIRD PARTY.
+
+The authors shall not be liable under any circumstances for any direct,
+indirect, special, incidental, or consequential damages with respect to any
+claim by USER or any third party on account of or arising from the use, or
+inability to use, this software or its associated documentation, even if the
+authors have been advised of the possibility of those damages.
+***********************************************************************************************/
+
+/**
+  * Parser for BLTL properties where arbitrary relational expressions on
+  * real variables serve as the propositions. Currently, the real
+  * time bounds in the properties only have an upper bound, with an
+  * implicit lower bound of 0.
+  *
+  * Allowed temporal operators - F (future), U (until) and G (global)
+  *
+  * Unbounded temporal operators are not allowed
+  *
+  * The usual precedence among the operators is used
+  *
+  * Tested on GNU Bison version 2.3. No guarantees on other versions of Bison or
+  * even Yacc.
+  */
+
+// VERBOSE blocks are not going to work anymore....as the code has changed a LOT
+// since these blocks were written
+
+%{
+  #include "defs.hpp"
+  #include "lex.yy.c" /* can't think of a better way to avoid clashes between C
+                         and C++ */
+
+  extern FILE *yyin;
+  extern char *yytext;
+  Block *parse_tree; // root of the parse-dag
+  int blockCount = 0; // number of blocks
+
+  vector<Block *> eq, neq, lt, lte, gt, gte, dlr, clr, frf,
+                  grf, ulrf;
+                  // store the blocks created so far, for the respective operators to enable
+                  // sharing
+  Block *fal = NULL; // block representing FALSE
+  Block *tru = NULL; // block representing TRUE
+  vector<Arithmetic *> var; // stores the arithmetics denoting "variables" to
+                            //   add the indices (into the observation array)
+                            //   after seeing the trace file
+
+
+  #ifdef VERBOSE
+    class Q_el {
+    public:
+      Node *n;
+      Q_el *next;
+    };
+  #endif
+
+  void copySubtreeParse(Block *);
+  void copySubtreeParse(Arithmetic *);
+  void recursiveDelete(Block *);
+  void recursiveDelete(Arithmetic *);
+  Block *find(vector<Block *>, const double &, Block *, Block *);
+  Block *find(vector<Block *>, Arithmetic *, Arithmetic *);
+  Block *pushNeg(Block *);
+  void assignIds(Block *);
+  #ifdef VERBOSE
+    void traverse(Node *);
+  #endif
+  int yyerror(const char *);
+%}
+
+%token ID_TOK
+%token T_DOUBLE_TOK
+%token T_INT_TOK
+%token TRUE_TOK
+%token FALSE_TOK
+%token L_PAREN_TOK
+%token R_PAREN_TOK
+%token L_SQUARE_TOK
+%token R_SQUARE_TOK
+%token COMMA_TOK
+%token EQ_TOK
+%token NEQ_TOK
+%token LTE_TOK
+%token LT_TOK
+%token GTE_TOK
+%token GT_TOK
+%token MUL_TOK
+%token ADD_TOK
+%token SUB_TOK
+%token DIV_TOK
+%token NEG_TOK
+%token AND_TOK
+%token OR_TOK
+%token NEXT_TOK
+%token FUTURE_TOK
+%token GLOBAL_TOK
+%token UNTIL_TOK
+%token UNKN_TOK
+%token ENDOFFILE
+
+%error-verbose
+
+%union {
+  double constant;
+  Block *block_node;
+  Arithmetic *arith_node;
+}
+
+%type <constant> bound
+%type <block_node> formula disj conj until neg relation
+%type <arith_node> sum term factor
+
+%%
+formula: disj
+           {
+             #ifdef VERBOSE
+               printf("\tformula: disj\n");
+             #endif
+             $$ = $1;
+             #ifdef VERBOSE
+               traverse($$);
+             #endif
+             /* copy $$ to global memory */
+             parse_tree = $$;
+             assignIds(parse_tree);
+           }
+       ;
+
+disj: conj
+        {
+          #ifdef VERBOSE
+            printf("\tdisj: conj\n");
+          #endif
+          $$ = $1;
+        }
+    | disj OR_TOK conj
+        {
+          #ifdef VERBOSE
+            printf("\tdisj: disj OR conj\n");
+          #endif
+          if ($1 == $3) {
+            $$ = $1;
+          } else {
+            $$ = find(dlr, -0.1, $1, $3);
+            if ($$ == NULL) {
+              $$ = new Block(NOOP, D_LR, -0.1, $1, $3);
+              dlr.push_back($$);
+            }
+          }
+        }
+    ;
+
+conj: until
+        {
+          #ifdef VERBOSE
+            printf("\tconj: until\n");
+          #endif
+          $$ = $1;
+        }
+    | conj AND_TOK until
+        {
+          #ifdef VERBOSE
+            printf("\tconj: conj AND until\n");
+          #endif
+          if ($1 == $3) {
+            $$ = $1;
+          } else {
+            $$ = find(clr, -0.1, $1, $3);
+            if ($$ == NULL) {
+              $$ = new Block(NOOP, C_LR, -0.1, $1, $3);
+              clr.push_back($$);
+            }
+          }
+        }
+    ;
+
+until: neg
+         {
+           #ifdef VERBOSE
+             printf("\tuntil: neg\n");
+           #endif
+           $$ = $1;
+         }
+     | until UNTIL_TOK L_SQUARE_TOK bound R_SQUARE_TOK neg
+         {
+           #ifdef VERBOSE
+             printf("\tuntil: until UNTIL L_SQUARE bound R_SQUARE neg\n");
+           #endif
+           if ($1 == $6) {
+             $$ = $1;
+           } else {
+             $$ = find(ulrf, $4, $1, $6);
+             if ($$ == NULL) {
+               $$ = new Block(NOOP, U_LRF, $4, $1, $6);
+               ulrf.push_back($$);
+             }
+           }
+         }
+     ;
+
+neg: NEG_TOK neg
+       {
+         #ifdef VERBOSE
+           printf("\tneg: NEG neg\n");
+         #endif
+         //$$ = pushNeg((LogicalRelationalNode *)$2);
+         $$ = pushNeg($2);
+       }
+/*   | NEXT_TOK L_SQUARE_TOK R_SQUARE_TOK neg
+       {
+         #ifdef VERBOSE
+           printf("\tneg: NEXT L_SQUARE R_SQUARE neg\n");
+         #endif
+         $$ = new Block(NOOP, X, 1, NULL, $4);
+       } */
+   | FUTURE_TOK L_SQUARE_TOK bound R_SQUARE_TOK neg
+       {
+         #ifdef VERBOSE
+           printf("\tneg: FUTURE L_SQUARE bound R_SQUARE neg\n");
+         #endif
+         $$ = find(frf, $3, NULL, $5);
+         if ($$ == NULL) {
+           $$ = new Block(NOOP, F_RF, $3, NULL, $5);
+           frf.push_back($$);
+         }
+       }
+   | GLOBAL_TOK L_SQUARE_TOK bound R_SQUARE_TOK neg
+       {
+         #ifdef VERBOSE
+           printf("\tneg: GLOBAL L_SQUARE bound R_SQUARE neg\n");
+         #endif
+         $$ = find(grf, $3, NULL, $5);
+         if ($$ == NULL) {
+           $$ = new Block(NOOP, G_RF, $3, NULL, $5);
+           grf.push_back($$);
+         }
+       }
+   | relation
+       {
+         #ifdef VERBOSE
+           printf("\tneg: relation\n");
+         #endif
+         $$ = $1;
+       }
+   ;
+
+bound: T_INT_TOK
+         {
+           #ifdef VERBOSE
+             printf("\tbound: T_INT\n");
+           #endif
+           $$ = atof(yytext);
+         }
+     | T_DOUBLE_TOK
+         {
+           #ifdef VERBOSE
+             printf("\tbound: T_DOUBLE\n");
+           #endif
+           $$ = atof(yytext);
+         }
+     ;
+
+relation: TRUE_TOK
+            {
+              #ifdef VERBOSE
+                printf("\trelation: TRUE\n");
+              #endif
+              if (tru == NULL) {
+                $$ = new Block(NOOP, T, -0.1, (Block *)NULL, (Block *)NULL);
+                tru = $$;
+              } else {
+                $$ = tru;
+              }
+            }
+        | FALSE_TOK
+            {
+              #ifdef VERBOSE
+                printf("\trelation: FALSE\n");
+              #endif
+              if (fal == NULL) {
+                $$ = new Block(NOOP, F, -0.1, (Block *)NULL, (Block *)NULL);
+                fal = $$;
+              } else {
+                $$ = fal;
+              }
+            }
+        | L_PAREN_TOK disj R_PAREN_TOK
+            {
+              #ifdef VERBOSE
+                printf("\trelation: L_PAREN disj R_PAREN\n");
+              #endif
+              $$ = $2;
+            }
+        // all the "find" calls below don't test if the parameters are "the"
+        // children, but if they logically are the same as the children.
+        //
+        // for e.g., for a subformula like p>q, if there is a Block of type B in
+        // gt already with its children "denoting" p and q, we can use that
+        // directly. now the arguments $1, $3 can be different objects of
+        // Arithmetic still "denoting" p and q...
+        | sum LTE_TOK sum
+            {
+              #ifdef VERBOSE
+                printf("\trelation: sum LTE sum\n");
+              #endif
+              $$ = find(lte, $1, $3);
+              if ($$ == NULL) {
+                $$ = new Block(LTE, B, -0.1, $1, $3);
+                lte.push_back($$);
+              } else {
+                recursiveDelete($1);
+                recursiveDelete($3);
+              }
+            }
+        | sum LT_TOK sum
+            {
+              #ifdef VERBOSE
+                printf("\trelation: sum LT sum\n");
+              #endif
+              $$ = find(lt, $1, $3);
+              if ($$ == NULL) {
+                $$ = new Block(LT, B, -0.1, $1, $3);
+                lt.push_back($$);
+              } else {
+                recursiveDelete($1);
+                recursiveDelete($3);
+              }
+            }
+        | sum EQ_TOK sum
+            {
+              #ifdef VERBOSE
+                printf("\trelation: sum EQ sum\n");
+              #endif
+              $$ = find(eq, $1, $3);
+              if ($$ == NULL) {
+                $$ = new Block(EQ, B, -0.1, $1, $3);
+                eq.push_back($$);
+              } else {
+                recursiveDelete($1);
+                recursiveDelete($3);
+              }
+            }
+        | sum NEQ_TOK sum
+            {
+              #ifdef VERBOSE
+                printf("\trelation: sum NEQ sum\n");
+              #endif
+              $$ = find(neq, $1, $3);
+              if ($$ == NULL) {
+                $$ = new Block(NEQ, B, -0.1, $1, $3);
+                neq.push_back($$);
+              } else {
+                recursiveDelete($1);
+                recursiveDelete($3);
+              }
+            }
+        | sum GTE_TOK sum
+            {
+              #ifdef VERBOSE
+                printf("\trelation: sum GTE sum\n");
+              #endif
+              $$ = find(gte, $1, $3);
+              if ($$ == NULL) {
+                $$ = new Block(GTE, B, -0.1, $1, $3);
+                gte.push_back($$);
+              } else {
+                recursiveDelete($1);
+                recursiveDelete($3);
+              }
+            }
+        | sum GT_TOK sum
+            {
+              #ifdef VERBOSE
+                printf("\trelation: sum GT sum\n");
+              #endif
+              $$ = find(gt, $1, $3);
+              if ($$ == NULL) {
+                $$ = new Block(GT, B, -0.1, $1, $3);
+                gt.push_back($$);
+              } else {
+                recursiveDelete($1);
+                recursiveDelete($3);
+              }
+            }
+        ;
+
+sum: term
+       {
+         #ifdef VERBOSE
+           printf("\tsum: term\n");
+         #endif
+         $$ = $1;
+       }
+   | SUB_TOK term
+       {
+         #ifdef VERBOSE
+           printf("\tsum: SUB term\n");
+         #endif
+         $$ = new Arithmetic(SUB, "", 0.0, NULL, $2);
+       }
+   | ADD_TOK term
+       {
+         #ifdef VERBOSE
+           printf("\tsum: ADD term\n");
+         #endif
+         $$ = new Arithmetic(ADD, "", 0.0, NULL, $2);
+       }
+   | sum ADD_TOK term
+       {
+         #ifdef VERBOSE
+           printf("\tsum: sum ADD term\n");
+         #endif
+         $$ = new Arithmetic(ADD, "", 0.0, $1, $3);
+       }
+   | sum SUB_TOK term
+       {
+         #ifdef VERBOSE
+           printf("\tsum: sum SUB term\n");
+         #endif
+         $$ = new Arithmetic(SUB, "", 0.0, $1, $3);
+       }
+   ;
+
+term: factor
+        {
+          #ifdef VERBOSE
+            printf("\tterm: factor\n");
+          #endif
+          $$ = $1;
+        }
+    | term MUL_TOK factor
+        {
+          #ifdef VERBOSE
+            printf("\tterm: term MUL factor\n");
+          #endif
+          $$ = new Arithmetic(MUL, "", 0.0, $1, $3);
+        }
+    | term DIV_TOK factor
+        {
+          #ifdef VERBOSE
+            printf("\tterm: term DIV factor\n");
+          #endif
+          $$ = new Arithmetic(DIV, "", 0.0, $1, $3);
+        }
+    ;
+
+factor: T_INT_TOK
+          {
+            #ifdef VERBOSE
+              printf("\tfactor: T_INT\n");
+            #endif
+            $$ = new Arithmetic(NOOP, "", atof(yytext), NULL, NULL);
+          }
+      | T_DOUBLE_TOK
+          {
+            #ifdef VERBOSE
+              printf("\tfactor: T_DOUBLE\n");
+            #endif
+            $$ = new Arithmetic(NOOP, "", atof(yytext), NULL, NULL);
+          }
+      | ID_TOK
+          {
+            #ifdef VERBOSE
+              printf("\tfactor: ID\n");
+            #endif
+            $$ = new Arithmetic(NOOP, yytext, 0.0, NULL, NULL);
+            var.push_back($$);
+          }
+      | L_PAREN_TOK sum R_PAREN_TOK
+          {
+            #ifdef VERBOSE
+              printf("\tfactor: L_PAREN sum R_PAREN\n");
+            #endif
+            $$ = $2;
+          }
+      ;
+
+%%
+
+// only used for blocks of type B. note that except the root of this subtree,
+// every other node is Arithmetic
+void copySubtreeParse(Block *b) {
+#ifdef ASSERTS
+  assert(b != NULL);
+  assert(b -> t == B);
+#endif
+  Arithmetic *la, *ra, *ga;
+  Block *b1; Arithmetic *a;
+
+  /* left */
+  ga = b -> G -> LA;
+  if (ga == NULL) {
+    la = NULL;
+  } else {
+    la = new Arithmetic(ga, b, LEFT);
+    if (!(la -> var).empty()) { // if it's a variable
+      var.push_back(la);
+    }
+  }
+  b -> LA = la;
+  if (la != NULL) {
+    copySubtreeParse(la);
+  }
+
+  /* right */
+  ga = b -> G -> RA;
+  if (ga == NULL) {
+    ra = NULL;
+  } else {
+    ra = new Arithmetic(ga, b, LEFT);
+    if (!(ra -> var).empty()) { // if it's a variable
+      var.push_back(ra);
+    }
+  }
+  b -> RA = ra;
+  if (ra != NULL) {
+    copySubtreeParse(ra);
+  }
+}
+
+void copySubtreeParse(Arithmetic *a) {
+#ifdef ASSERTS
+  assert(a != NULL);
+#endif
+  Arithmetic *l, *r, *g;
+
+  g = a -> G -> L;
+  if (g == NULL) {
+    l = NULL;
+  } else {
+    l = new Arithmetic(g, a, LEFT);
+    if (!(l -> var).empty()) { // if it's a variable
+      var.push_back(l);
+    }
+  }
+  a -> L = l;
+  if (l != NULL) {
+    copySubtreeParse(l);
+  }
+
+  g = a -> G -> R;
+  if (g == NULL) {
+    r = NULL;
+  } else {
+    r = new Arithmetic(g, a, RIGHT);
+    if (!(r -> var).empty()) { // if it's a variable
+      var.push_back(r);
+    }
+  }
+  a -> R = r;
+  if (l != NULL) {
+    copySubtreeParse(r);
+  }
+}
+
+// find the block in v with bound d and children l and r
+Block *find(vector<Block *> v, const double &d, Block *l, Block *r) {
+  Block *b;
+  for (vector<Block *>::iterator it = v.begin(); it != v.end(); it++) {
+    b = (*it);
+    if (b -> bound == d && b -> LB == l && b -> RB == r) {
+      return b;
+    }
+  }
+  return NULL;
+}
+
+// tests if a1 and a2 are the same in the sense that they compute the same values
+bool matchArithmetic(Arithmetic *a1, Arithmetic *a2) {
+  if (a1 -> op != a2 -> op) return false;
+  bool b1, b2;
+  if (a1 -> op == NOOP) {
+    if (!(a1 -> var).empty()) {
+      if ((a1 -> var).compare((a2 -> var)) != 0) {
+        return false;
+      }
+    } else {
+      if (a1 -> val != a2 -> val) {
+        return false;
+      }
+    }
+  }
+  if (a1 -> L) {
+    if (a2 -> L == NULL) return false;
+    b1 = matchArithmetic(a1 -> L, a2 -> L);
+  }
+  if (a1 -> R) {
+    if (a2 -> R == NULL) return false;
+    b2 = matchArithmetic(a1 -> R, a2 -> R);
+  }
+  if (b1 == false || b2 == false)
+    return false;
+
+  return true;
+}
+
+// find the block with children functioning similar to l and r
+Block *find(vector<Block *> v, Arithmetic *l, Arithmetic *r) {
+  // It's known that blocks in v are of type B
+  Block *b;
+  for (vector<Block *>::iterator it = v.begin(); it != v.end(); it++) {
+    b = (*it);
+    // go through the children of b recursively and check if they are same as l
+    // and r, semantically. And not syntactically matching the pointer
+    // addresses!
+    if (matchArithmetic(b -> LA, l) && matchArithmetic(b -> RA, r)) {
+      return b;
+    }
+  }
+  return NULL;
+}
+
+// remove a from the vector "var"
+void removeFromVar(Arithmetic *a) {
+  for (vector<Arithmetic *>::iterator it = var.begin(); it != var.end(); it++) {
+    if (*it == a) {
+      var.erase(it);
+      break;
+    }
+  }
+}
+
+// delete the unwanted arithmetics (which don't propagate to anybody) in the
+// subtree rooted at a
+void recursiveDelete(Arithmetic *a) {
+  if (a -> L) {
+    recursiveDelete(a -> L);
+  }
+  if (a -> R) {
+    recursiveDelete(a -> R);
+  }
+  /* if it is a variable, remove from "var" */
+  if (!(a -> var).empty()) {
+    removeFromVar(a);
+  }
+  delete a;
+}
+
+// delete the unwanted blocks (which don't propagate to anybody) in the
+// subtree rooted at b
+void recursiveDelete(Block *b) {
+  map<Block *, Direction> &m = b -> propagate;
+  switch (b -> t) {
+  case F:
+  case T:
+    delete b;
+    break;
+  case B:
+    if (b -> LA) {
+      recursiveDelete(b -> LA);
+    }
+    if (b -> RA) {
+      recursiveDelete(b -> RA);
+    }
+    delete b;
+    break;
+  default:
+    if (b -> LB) {
+      m = (b -> LB) -> propagate;
+      m.erase(m.find(b));
+      if (m.empty()) {
+        recursiveDelete(b -> LB);
+      }
+    }
+    if (b -> RB) {
+      m = (b -> RB) -> propagate;
+      m.erase(m.find(b));
+      if (m.empty()) {
+        recursiveDelete(b -> RB);
+      }
+    }
+    delete b;
+    break;
+  }
+}
+
+/**
+ * this is a utility function for converting the input property to Negation Normal
+ * Form. It pushes the negation sign inwards recursively
+ */
+Block *pushNeg(Block *b) {
+  if (b == NULL) {
+    printf("error! pushing neg inside NULL\n");
+    return NULL;
+  }
+  Block *lb, *rb, *ret;
+  Block *lb1, *rb1, *rb2, *temp;
+  lb = b -> LB;
+  rb = b -> RB;
+  switch (b -> t) {
+  case T:
+    if (fal != NULL) {
+      ret = fal;
+    } else {
+      ret = fal = new Block(NOOP, F, -0.1, (Block *)NULL, (Block *)NULL);
+    }
+    break;
+
+  case F:
+    if (tru != NULL) {
+      ret = tru;
+    } else {
+      ret = tru = new Block(NOOP, T, -0.1, (Block *)NULL, (Block *)NULL);
+    }
+    break;
+
+  case B:
+    switch (b -> op) {
+    case EQ:
+      ret = find(neq, b -> LA, b -> RA);
+      if (ret == NULL) {
+        ret = new Block(NEQ, B, -0.1, b);
+        copySubtreeParse(ret);
+        ret -> G = ret;
+        neq.push_back(ret);
+      }
+      break;
+
+    case NEQ:
+      ret = find(eq, b -> LA, b -> RA);
+      if (ret == NULL) {
+        ret = new Block(EQ, B, -0.1, b);
+        copySubtreeParse(ret);
+        ret -> G = ret;
+        eq.push_back(ret);
+      }
+      break;
+
+    case LT:
+      ret = find(gte, b -> LA, b -> RA);
+      if (ret == NULL) {
+        ret = new Block(GTE, B, -0.1, b);
+        copySubtreeParse(ret);
+        ret -> G = ret;
+        gte.push_back(ret);
+      }
+      break;
+
+    case LTE:
+      ret = find(gt, b -> LA, b -> RA);
+      if (ret == NULL) {
+        ret = new Block(GT, B, -0.1, b);
+        copySubtreeParse(ret);
+        ret -> G = ret;
+        gt.push_back(ret);
+      }
+      break;
+
+    case GT:
+      ret = find(lte, b -> LA, b -> RA);
+      if (ret == NULL) {
+        ret = new Block(LTE, B, -0.1, b);
+        copySubtreeParse(ret);
+        ret -> G = ret;
+        lte.push_back(ret);
+      }
+      break;
+
+    case GTE:
+      ret = find(lt, b -> LA, b -> RA);
+      if (ret == NULL) {
+        ret = new Block(LT, B, -0.1, b);
+        copySubtreeParse(ret);
+        ret -> G = ret;
+        lt.push_back(ret);
+      }
+      break;
+
+    default:
+      assert(0);
+    }
+
+    break;
+
+  case D_LR:
+    lb1 = pushNeg(lb);
+    rb1 = pushNeg(rb);
+
+    ret = find(clr, -0.1, lb1, rb1);
+    if (ret == NULL) {
+      ret = new Block(NOOP, C_LR, -0.1, lb1, rb1);
+      clr.push_back(ret);
+    } 
+
+    break;
+
+  case C_LR:
+    lb1 = pushNeg(lb);
+    rb1 = pushNeg(rb);
+
+    ret = find(dlr, -0.1, lb1, rb1);
+    if (ret == NULL) {
+      ret = new Block(NOOP, D_LR, -0.1, lb1, rb1);
+      dlr.push_back(ret);
+    } 
+
+    break;
+
+  case F_RF:
+    rb1 = pushNeg(rb);
+
+    ret = find(grf, b -> bound, NULL, rb1);
+    if (ret == NULL) {
+      ret = new Block(NOOP, G_RF, b -> bound, NULL, rb1);
+      grf.push_back(ret);
+    }
+
+    break;
+
+  case G_RF:
+    rb1 = pushNeg(rb);
+
+    ret = find(frf, b -> bound, NULL, rb1);
+    if (ret == NULL) {
+      ret = new Block(NOOP, F_RF, b -> bound, NULL, rb1);
+      frf.push_back(ret);
+    }
+
+    break;
+
+  case U_LRF:
+    // ~(pUq) = [~q U (~p /\ ~q)] \/ G(~q)
+    lb1 = pushNeg(lb);
+    rb1 = pushNeg(rb);
+
+    // ~p /\ ~q
+    rb2 = find(clr, -0.1, lb1, rb1);
+    if (rb2 == NULL) {
+      rb2 = new Block(NOOP, C_LR, -0.1, lb1, rb1);
+      clr.push_back(rb2);
+    }
+
+    // ~q U (~p /\ ~q)
+    temp = find(ulrf, b -> bound, lb1, rb2);
+    if (temp == NULL) {
+      lb1 = new Block(NOOP, U_LRF, b -> bound, lb1, rb2);
+      ulrf.push_back(lb1);
+    } else {
+      lb1 = temp;
+    }
+
+    // G(~q)
+    rb2 = find(grf, b -> bound, NULL, rb1);
+    if (rb2 == NULL) {
+      rb2 = new Block(NOOP, G_RF, b -> bound, NULL, rb1);
+      grf.push_back(rb2);
+    }
+
+    // the rest...
+    ret = find(dlr, -0.1, lb1, rb2);
+    if (ret == NULL) {
+      ret = new Block(NOOP, D_LR, -0.1, lb1, rb2);
+      dlr.push_back(ret);
+    }
+
+    break;
+  }
+
+  if ((b->propagate).empty()) { // you only created the negated version of b.
+                                // now, b (and its subtree) is not needed, if b
+                                // doesn't propagate to anybody!
+    recursiveDelete(b); // delete b from its children's propagates, delete b,
+                        // call the function on the children if their propagates
+                        // are empty
+  }
+
+  return ret;
+}
+
+
+//Block *pushNeg(Block *b) {
+////LogicalRelationalNode *pushNeg(LogicalRelationalNode *n)
+//  if (b == NULL) {
+//    printf("error! pushing neg inside NULL\n");
+//    return NULL;
+//  }
+//  switch (b -> t) {
+//  case T:
+//    b -> t = F;
+//    break;
+//
+//  case F:
+//    b -> t = T;
+//    break;
+//
+//  case B:
+//    switch (b -> op) {
+//    case EQ:
+//      b -> op = NEQ;
+//      break;
+//    case NEQ:
+//      b -> op = EQ;
+//      break;
+//    case LT:
+//      b -> op = GTE;
+//      break;
+//    case LTE:
+//      b -> op = GT;
+//      break;
+//    case GT:
+//      b -> op = LTE;
+//      break;
+//    case GTE:
+//      b -> op = LT;
+//      break;
+//    default:
+//      assert(0);
+//    }
+//    break;
+//
+//  case D_LR:
+//    b -> t = C_LR;
+//    b -> LB = pushNeg(b -> LB);
+//    b -> RB = pushNeg(b -> RB);
+//    break;
+//
+//  case C_LR:
+//    b -> t = D_LR;
+//    b -> LB = pushNeg(b -> LB);
+//    b -> RB = pushNeg(b -> RB);
+//    break;
+//
+//  case F_RF:
+//    b -> t = G_RF;
+//    b -> RB = pushNeg(b -> RB);
+//    break;
+//
+//  case G_RF:
+//    b -> t = F_RF;
+//    b -> RB = pushNeg(b -> RB);
+//    break;
+//
+//  case U_LRF:
+//    // get accurate value for blockCount, by first counting the number of
+//    // "block"s in the left and right subtree (p and q), and second, subtracting
+//    // this number from blockCount and starting over...don't think of using bL
+//    // and bR - just delete them at the end!
+//    // ~(pUq) = [~q U (~p /\ ~q)] | G(~q)
+//    Block *b1, *b2;
+//    Block *bL = pushNeg(b -> LB);
+//    Block *bR = pushNeg(b -> RB);
+//
+//    // copying ~q
+//    b2 = new Block(*bR);
+//    copySubtreeParse(b2);
+//    b2 -> G = b2;
+//
+//    b2 = new Block(NOOP, C_LR, -0.1, bL, b2); // ~p /\ ~q
+//
+//    // copying ~q
+//    b1 = new Block(*bR);
+//    copySubtreeParse(b1);
+//    b1 -> G = b1;
+//
+//    b1 = new Block(NOOP, U_LRF, b -> bound, b1, b2);
+//
+//    b2 = new Block(NOOP, G_RF, b -> bound, NULL, bR);
+//
+//    b = new Block(NOOP, D_LR, -0.1, b1, b2);
+//
+//    break;
+//  }
+//  return b;
+//}
+
+// assign ids to blocks
+void assignIds(Block *b) {
+  if (b -> id >= 0) return; // revisited!
+
+  if (b -> LB) {
+    assignIds(b -> LB);
+  }
+  b -> id = blockCount;
+  blockCount++;
+  if (b -> RB) {
+    assignIds(b -> RB);
+  }
+}
+
+#ifdef VERBOSE
+  /**
+   * traverse the entire subtree rooted at "root" in a breadth-first manner and
+   * print out some information
+   */
+  void traverse(Node *root) {
+    /* do a bfs */
+    Q_el *head, *end;
+    Node *current;
+  
+    head = new Q_el();
+    head -> n = root;
+    head -> next = NULL;
+    end = head;
+  
+    Arithmetic *a; string var; double val;
+    Block *b;
+    while (head != NULL) {
+      current = head -> n;
+      if (current->left == NULL && current->right == NULL) {
+        /* leaf node */
+        if (current->getType() == ARITHMETIC) {
+          a = current -> getA();
+          var = a -> getVar(); val = a -> getVal();
+          if (!var.empty()) {
+            cout << var << "  ";
+          } else {
+            cout << val << "  ";
+          }
+        } else {
+          b = current -> getB();
+          if (b -> getType() == T) {
+            cout << "TRUE  ";
+          } else if (b -> getType() == F) {
+            cout << "FALSE  ";
+          } else {
+            assert(0);
+          }
+        }
+      } else {
+        /* non-leaf node */
+        if (current->getType() == ARITHMETIC) {
+          a = current -> getA();
+          cout << a -> getOp() << "  ";
+        } else {
+          b = current -> getB();
+          cout << b -> getOp() << ":" << b -> getBound() << "  ";
+        }
+        if (current->left != NULL) {
+          end->next = new Q_el();
+          end->next->n = current->left;
+          end = end->next;
+          end->next = NULL;
+        }
+        if (current->right != NULL) {
+          end->next = new Q_el();
+          end->next->n = current->right;
+          end = end->next;
+          end->next = NULL;
+        }
+      }
+      head = head -> next;
+    }
+    printf("\n");
+  }
+#endif
+
+/**
+ * this is called when a parse error is encountered by Bison
+ */
+int yyerror(const char *s) {
+  printf("%s\n", s);
+}

@@ -1,0 +1,47 @@
+K 25
+svn:wc:ra_dav:version-url
+V 28
+/svn/code/!svn/ver/5/monitor
+END
+test.cpp
+K 25
+svn:wc:ra_dav:version-url
+V 37
+/svn/code/!svn/ver/6/monitor/test.cpp
+END
+headers.hpp
+K 25
+svn:wc:ra_dav:version-url
+V 40
+/svn/code/!svn/ver/4/monitor/headers.hpp
+END
+parser.ypp
+K 25
+svn:wc:ra_dav:version-url
+V 39
+/svn/code/!svn/ver/2/monitor/parser.ypp
+END
+checker.cpp
+K 25
+svn:wc:ra_dav:version-url
+V 40
+/svn/code/!svn/ver/4/monitor/checker.cpp
+END
+defs.hpp
+K 25
+svn:wc:ra_dav:version-url
+V 37
+/svn/code/!svn/ver/8/monitor/defs.hpp
+END
+lexer.l
+K 25
+svn:wc:ra_dav:version-url
+V 36
+/svn/code/!svn/ver/7/monitor/lexer.l
+END
+Makefile
+K 25
+svn:wc:ra_dav:version-url
+V 37
+/svn/code/!svn/ver/4/monitor/Makefile
+END
